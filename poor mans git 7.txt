@@ -1,0 +1,307 @@
+//+------------------------------------------------------------------+
+//| Dual-Mode EA V2.1: Added Trend SL/TP + Mismatch Exit (XAUUSD)    |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//=== Inputs: Common ===
+input double LotSize = 0.1;
+
+//=== Inputs: Trend Strategy (User's Original) ===
+input int FastMAPeriod = 50;
+input int SlowMAPeriod = 200;
+input int FibLookbackBars = 200;
+input double FibToleranceUSD = 50.0;
+input bool UseFibonacci = true;
+input int OBLookbackBars = 50;
+input double OBImpulseMult = 1.5;
+
+// *** NEW: SL/TP for Trend Strategy (Solves "Hold Too Long") ***
+input int Trend_SL_Points = 50000;  // Stop Loss สำหรับ Trend (50000 points = $50)
+input int Trend_TP_Points = 100000; // Take Profit สำหรับ Trend (100000 points = $100)
+
+//=== Inputs: Market Detector ===
+input int ADX_Period = 14;
+input double ADX_Threshold = 25.0;
+
+//=== Inputs: Sideways Strategy (New Algo) ===
+input int RSI_Period = 14;
+input double RSI_Overbought = 70.0;
+input double RSI_Oversold = 30.0;
+input int Sideways_SL_Points = 10000;
+input int Sideways_TP_Points = 15000;
+
+// Handles
+int fastHandle, slowHandle, adxHandle, rsiHandle;
+datetime lastBarTime = 0;
+
+// Fibonacci levels
+double fibLevels[5];
+
+// --- Comment Identifiers (NEW) ---
+#define COMMENT_TREND_BUY "Trend MA Buy"
+#define COMMENT_TREND_SELL "Trend MA Sell"
+#define COMMENT_SIDEWAYS_BUY "Sideways RSI Buy"
+#define COMMENT_SIDEWAYS_SELL "Sideways RSI Sell"
+
+
+//+------------------------------------------------------------------+
+//| START: User's Original Functions (No Changes)                    |
+//+------------------------------------------------------------------+
+void CalculateFibLevels()
+{
+   double highest = -DBL_MAX;
+   double lowest = DBL_MAX;
+   int bars = MathMin(FibLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-1);
+
+   for(int i=1; i<=bars; i++)
+   {
+      double hi = iHigh(NULL, 0, i);
+      double lo = iLow(NULL, 0, i);
+      if(hi > highest) highest = hi;
+      if(lo < lowest)  lowest = lo;
+   }
+   if(highest <= lowest) return;
+   fibLevels[0] = lowest + (highest - lowest) * 0.382;
+   fibLevels[1] = lowest + (highest - lowest) * 0.5;
+   fibLevels[2] = lowest + (highest - lowest) * 0.618;
+   fibLevels[3] = lowest + (highest - lowest) * 0.786;
+   fibLevels[4] = lowest;
+}
+bool PriceNearFib(double price)
+{
+   double tol = FibToleranceUSD;
+   for(int i = 0; i < 5; i++)
+      if(MathAbs(price - fibLevels[i]) <= tol)
+         return true;
+   return false;
+}
+bool CheckOrderBlock(bool forBuy)
+{
+   int bars = MathMin(OBLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-2);
+   for(int i=2; i<=bars; i++)
+   {
+      double o = iOpen(NULL,0,i);
+      double c = iClose(NULL,0,i);
+      double o1 = iOpen(NULL,0,i-1);
+      double c1 = iClose(NULL,0,i-1);
+      double body = MathAbs(c1 - o1);
+      double prevBody = MathAbs(c - o);
+      if(forBuy)
+      {
+         if(c1 > o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+      else
+      {
+         if(c1 < o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| END: User's Original Functions                                   |
+//+------------------------------------------------------------------+
+
+
+//+------------------------------------------------------------------+
+//| STRATEGY 1: Run Trend Following (MODIFIED: Added SL/TP)          |
+//+------------------------------------------------------------------+
+void RunTrendingStrategy()
+{
+   double fastMA[2], slowMA[2];
+   if(CopyBuffer(fastHandle,0,0,2,fastMA) < 2 || CopyBuffer(slowHandle,0,0,2,slowMA) < 2)
+      return;
+
+   double price = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   if(UseFibonacci)
+   {
+      CalculateFibLevels();
+      if(!PriceNearFib(price))
+      {
+         return;
+      }
+   }
+ 
+   // *** NEW: Get Prices and SL/TP levels for Trend ***
+   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double slBuy = ask - Trend_SL_Points * _Point;
+   double tpBuy = ask + Trend_TP_Points * _Point;
+   double slSell = bid + Trend_SL_Points * _Point;
+   double tpSell = bid - Trend_TP_Points * _Point;
+   // *************************************************
+
+   bool positionOpen = PositionSelect(Symbol());
+   long positionType = -1;
+   if(positionOpen)
+      positionType = PositionGetInteger(POSITION_TYPE);
+ 
+   // --- Bullish crossover (User's original) + Order Block ---
+   if(fastMA[1] > slowMA[1] && fastMA[0] < slowMA[0] && CheckOrderBlock(true))
+   {
+      Print("TREND: BUY triggered (User's logic)");
+      if(!positionOpen)
+         // *** MODIFIED: Added SL/TP and Comment ***
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, COMMENT_TREND_BUY);
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         trade.PositionClose(Symbol());
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, COMMENT_TREND_BUY);
+      }
+   }
+
+   // --- Bearish crossover (User's original) + Order Block ---
+   if(fastMA[1] < slowMA[1] && fastMA[0] > slowMA[0] && CheckOrderBlock(false))
+   {
+      Print("TREND: SELL triggered (User's logic)");
+      if(!positionOpen)
+         // *** MODIFIED: Added SL/TP and Comment ***
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, COMMENT_TREND_SELL);
+      else if(positionType == POSITION_TYPE_BUY)
+      {
+         trade.PositionClose(Symbol());
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, COMMENT_TREND_SELL);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STRATEGY 2: Run Sideways (No Changes)                            |
+//+------------------------------------------------------------------+
+void RunSidewaysStrategy()
+{
+   double rsi[2];
+   if(CopyBuffer(rsiHandle, 0, 0, 2, rsi) < 2)
+   {
+      Print("SIDEWAYS: Error copying RSI buffer");
+      return;
+   }
+   
+   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double slBuy = ask - Sideways_SL_Points * _Point;
+   double tpBuy = ask + Sideways_TP_Points * _Point;
+   double slSell = bid + Sideways_SL_Points * _Point;
+   double tpSell = bid - Sideways_TP_Points * _Point;
+
+   bool positionOpen = PositionSelect(Symbol());
+   long positionType = -1;
+   if(positionOpen)
+      positionType = PositionGetInteger(POSITION_TYPE);
+      
+   // --- BUY Signal: RSI crosses UP from Oversold ---
+   if(rsi[1] < RSI_Oversold && rsi[0] > RSI_Oversold)
+   {
+      Print("SIDEWAYS: RSI BUY Triggered");
+      if(!positionOpen)
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, COMMENT_SIDEWAYS_BUY);
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         trade.PositionClose(Symbol());
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, COMMENT_SIDEWAYS_BUY);
+      }
+   }
+   
+   // --- SELL Signal: RSI crosses DOWN from Overbought ---
+   if(rsi[1] > RSI_Overbought && rsi[0] < RSI_Overbought)
+   {
+      Print("SIDEWAYS: RSI SELL Triggered");
+      if(!positionOpen)
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, COMMENT_SIDEWAYS_SELL);
+      else if(positionType == POSITION_TYPE_BUY)
+      {
+         trade.PositionClose(Symbol());
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, COMMENT_SIDEWAYS_SELL);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   fastHandle = iMA(NULL, PERIOD_CURRENT, FastMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   slowHandle = iMA(NULL, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   adxHandle = iADX(NULL, PERIOD_CURRENT, ADX_Period);
+   rsiHandle = iRSI(NULL, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+
+   if(fastHandle == INVALID_HANDLE || slowHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE)
+   {
+      Print("Error creating indicator handles");
+      return(INIT_FAILED);
+   }
+
+   CalculateFibLevels();
+   Print("EA Dual-Mode V2.1 Initialized (Trend SL/TP Added)");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization                                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(fastHandle);
+   IndicatorRelease(slowHandle);
+   IndicatorRelease(adxHandle);
+   IndicatorRelease(rsiHandle);
+   Print("EA Deinitialized. Handles released.");
+}
+
+//+------------------------------------------------------------------+
+//| Main Controller Logic (MODIFIED)                                 |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime barTime = iTime(NULL, 0, 0);
+   if(barTime == lastBarTime) return;
+   lastBarTime = barTime;
+
+   // --- 1. Market Detector (ADX) ---
+   double adxValue[1];
+   if(CopyBuffer(adxHandle, 0, 1, 1, adxValue) < 1)
+   {
+      Print("Error copying ADX buffer");
+      return;
+   }
+   
+   bool marketIsTrending = (adxValue[0] >= ADX_Threshold);
+
+   // --- 2. *** NEW: Mismatch Management *** ---
+   // (จัดการออเดอร์ที่เปิดอยู่ *ก่อน* หาออเดอร์ใหม่)
+   bool positionOpen = PositionSelect(Symbol());
+   
+   if(positionOpen)
+   {
+      string comment = PositionGetString(POSITION_COMMENT);
+      bool isSidewaysTrade = (comment == COMMENT_SIDEWAYS_BUY || comment == COMMENT_SIDEWAYS_SELL);
+      
+      // FIX: ถ้าถือออเดอร์ Sideways (สวนเทรนด์ระยะสั้น)
+      // แต่ตลาดเพิ่ง "เริ่มมีเทรนด์" (ADX > 25) -> ให้ปิดออเดอร์ Sideways ทันที
+      if(isSidewaysTrade && marketIsTrending)
+      {
+         Print("Exit (Mismatch): Sideways trade detected in new TRENDING market. Closing.");
+         trade.PositionClose(Symbol());
+         // ปิดแล้ว ออกไปเลย รอแท่งใหม่
+         return; 
+      }
+      
+      // **สำคัญ:** ถ้าเป็นออเดอร์ Trend (isTrendTrade) แต่ตลาดเป็น Sideways
+      // เรา *ไม่* ทำอะไร (ปล่อยให้มันวิ่งต่อไป) เพื่อแก้ปัญหา "ปิดเร็วเกินไป"
+      // ออเดอร์ Trend นั้นจะถูกป้องกันโดย SL/TP ที่เราเพิ่งเพิ่มเข้าไป
+   }
+
+
+   // --- 3. The Switch (หาออเดอร์ใหม่) ---
+   if(marketIsTrending)
+   {
+      RunTrendingStrategy();
+   }
+   else
+   {
+      RunSidewaysStrategy();
+   }
+}

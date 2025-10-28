@@ -1,0 +1,176 @@
+//+------------------------------------------------------------------+
+//| MA Crossover + Auto Fibonacci + Order Block Filter (XAUUSD)     |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//=== Inputs ===
+input int FastMAPeriod = 50;
+input int SlowMAPeriod = 200;
+input double LotSize = 0.1;
+
+// Fibonacci auto detect
+input int FibLookbackBars = 200;       // จำนวนแท่งย้อนหลังหาสูงสุด/ต่ำสุด
+input double FibToleranceUSD = 50.0;   // tolerance ประมาณ ±50 USD
+input bool UseFibonacci = true;
+
+// Order Block Filter
+input int OBLookbackBars = 50;         // จำนวนแท่งย้อนหลังตรวจ Order Block
+input double OBImpulseMult = 1.5;      // ความแรงของแท่งแรง
+
+int fastHandle, slowHandle;
+datetime lastBarTime = 0;
+
+// Fibonacci levels
+double fibLevels[5];
+
+//+------------------------------------------------------------------+
+//| Calculate Auto Fibonacci levels                                   |
+//+------------------------------------------------------------------+
+void CalculateFibLevels()
+{
+   double highest = -DBL_MAX;
+   double lowest = DBL_MAX;
+   int bars = MathMin(FibLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-1);
+
+   for(int i=1; i<=bars; i++)
+   {
+      double hi = iHigh(NULL, 0, i);
+      double lo = iLow(NULL, 0, i);
+      if(hi > highest) highest = hi;
+      if(lo < lowest)  lowest = lo;
+   }
+
+   if(highest <= lowest) return;
+
+   fibLevels[0] = lowest + (highest - lowest) * 0.382;
+   fibLevels[1] = lowest + (highest - lowest) * 0.5;
+   fibLevels[2] = lowest + (highest - lowest) * 0.618;
+   fibLevels[3] = lowest + (highest - lowest) * 0.786;
+   fibLevels[4] = lowest; // 100% retracement
+
+   PrintFormat("Fib Levels Auto-detected: 0.382=%.2f 0.5=%.2f 0.618=%.2f 0.786=%.2f 1.0=%.2f",
+               fibLevels[0], fibLevels[1], fibLevels[2], fibLevels[3], fibLevels[4]);
+}
+
+//+------------------------------------------------------------------+
+//| Check if price near Fibonacci                                     |
+//+------------------------------------------------------------------+
+bool PriceNearFib(double price)
+{
+   double tol = FibToleranceUSD; // กำหนดเป็น USD
+   for(int i = 0; i < 5; i++)
+      if(MathAbs(price - fibLevels[i]) <= tol)
+         return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Order Block Filter (simplified ICT/SMC style)                    |
+//+------------------------------------------------------------------+
+bool CheckOrderBlock(bool forBuy)
+{
+   int bars = MathMin(OBLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-2);
+
+   for(int i=2; i<=bars; i++)
+   {
+      double o = iOpen(NULL,0,i);
+      double c = iClose(NULL,0,i);
+      double o1 = iOpen(NULL,0,i-1);
+      double c1 = iClose(NULL,0,i-1);
+
+      double body = MathAbs(c1 - o1);
+      double prevBody = MathAbs(c - o);
+
+      if(forBuy)
+      {
+         // ถ้าแท่งก่อนหน้าเป็นแท่ง bullish แรงกว่าแท่งก่อนหน้า 1.5 เท่า
+         if(c1 > o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+      else
+      {
+         // ถ้าแท่งก่อนหน้าเป็นแท่ง bearish แรงกว่าแท่งก่อนหน้า 1.5 เท่า
+         if(c1 < o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   fastHandle = iMA(NULL, PERIOD_CURRENT, FastMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   slowHandle = iMA(NULL, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   if(fastHandle == INVALID_HANDLE || slowHandle == INVALID_HANDLE)
+   {
+      Print("Error creating MA handles");
+      return(INIT_FAILED);
+   }
+
+   CalculateFibLevels();
+   Print("EA initialized: MA Crossover + Auto Fibonacci + Order Block Filter");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Main trading logic                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime barTime = iTime(NULL, 0, 0);
+   if(barTime == lastBarTime) return;
+   lastBarTime = barTime;
+
+   double fastMA[2], slowMA[2];
+   if(CopyBuffer(fastHandle,0,0,2,fastMA) < 2 || CopyBuffer(slowHandle,0,0,2,slowMA) < 2)
+      return;
+
+   double price = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+
+   // --- Update Fibonacci ทุกบาร์ ---
+   if(UseFibonacci)
+      CalculateFibLevels();
+
+   bool nearFib = UseFibonacci ? PriceNearFib(price) : true;
+
+   if(!nearFib)
+   {
+      Print("No trade: price not near Fibonacci zone.");
+      return;
+   }
+
+   bool positionOpen = PositionSelect(Symbol());
+   long positionType = -1;
+   if(positionOpen)
+      positionType = PositionGetInteger(POSITION_TYPE);
+
+   // --- Bullish crossover + Order Block ---
+   if(fastMA[1] > slowMA[1] && fastMA[0] < slowMA[0] && CheckOrderBlock(true))
+   {
+      Print("BUY triggered: MA crossover + Fibonacci + Order Block");
+      if(!positionOpen)
+         trade.Buy(LotSize, Symbol());
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         trade.PositionClose(Symbol());
+         trade.Buy(LotSize, Symbol());
+      }
+   }
+
+   // --- Bearish crossover + Order Block ---
+   if(fastMA[1] < slowMA[1] && fastMA[0] > slowMA[0] && CheckOrderBlock(false))
+   {
+      Print("SELL triggered: MA crossover + Fibonacci + Order Block");
+      if(!positionOpen)
+         trade.Sell(LotSize, Symbol());
+      else if(positionType == POSITION_TYPE_BUY)
+      {
+         trade.PositionClose(Symbol());
+         trade.Sell(LotSize, Symbol());
+      }
+   }
+}

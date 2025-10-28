@@ -1,0 +1,289 @@
+//+------------------------------------------------------------------+
+//| Dual-Mode EA: MA Crossover (Trend) + RSI (Sideways) (XAUUSD)     |
+//+------------------------------------------------------------------+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//=== Inputs: Common ===
+input double LotSize = 0.1;
+
+//=== Inputs: Trend Strategy (User's Original) ===
+input int FastMAPeriod = 50;
+input int SlowMAPeriod = 200;
+input int FibLookbackBars = 200;      // จำนวนแท่งย้อนหลังหาสูงสุด/ต่ำสุด
+input double FibToleranceUSD = 50.0;  // tolerance ประมาณ ±50 USD
+input bool UseFibonacci = true;
+input int OBLookbackBars = 50;      // จำนวนแท่งย้อนหลังตรวจ Order Block
+input double OBImpulseMult = 1.5;   // ความแรงของแท่งแรง
+
+//=== Inputs: Market Detector ===
+input int ADX_Period = 14;          // Period ของ ADX
+input double ADX_Threshold = 25.0;  // ค่าที่ใช้แยกระหว่าง Trend (>) และ Sideways (<)
+
+//=== Inputs: Sideways Strategy (New Algo) ===
+input int RSI_Period = 14;
+input double RSI_Overbought = 70.0;   // ระดับ Overbought
+input double RSI_Oversold = 30.0;     // ระดับ Oversold
+input int Sideways_SL_Points = 10000; // Stop Loss สำหรับ Sideways (10000 points = $10 บน XAUUSD)
+input int Sideways_TP_Points = 15000; // Take Profit สำหรับ Sideways (15000 points = $15 บน XAUUSD)
+
+// Handles
+int fastHandle, slowHandle, adxHandle, rsiHandle;
+datetime lastBarTime = 0;
+
+// Fibonacci levels
+double fibLevels[5];
+
+//+------------------------------------------------------------------+
+//| START: User's Original Functions (Trend Strategy)                |
+//+------------------------------------------------------------------+
+void CalculateFibLevels()
+{
+   double highest = -DBL_MAX;
+   double lowest = DBL_MAX;
+   int bars = MathMin(FibLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-1);
+
+   for(int i=1; i<=bars; i++)
+   {
+      double hi = iHigh(NULL, 0, i);
+      double lo = iLow(NULL, 0, i);
+      if(hi > highest) highest = hi;
+      if(lo < lowest)  lowest = lo;
+   }
+
+   if(highest <= lowest) return;
+
+   fibLevels[0] = lowest + (highest - lowest) * 0.382;
+   fibLevels[1] = lowest + (highest - lowest) * 0.5;
+   fibLevels[2] = lowest + (highest - lowest) * 0.618;
+   fibLevels[3] = lowest + (highest - lowest) * 0.786;
+   fibLevels[4] = lowest; // 100% retracement
+
+   /* // ปิดไว้ไม่ให้ Log รก
+   PrintFormat("Fib Levels Auto-detected: 0.382=%.2f 0.5=%.2f 0.618=%.2f 0.786=%.2f 1.0=%.2f",
+               fibLevels[0], fibLevels[1], fibLevels[2], fibLevels[3], fibLevels[4]);
+   */
+}
+
+bool PriceNearFib(double price)
+{
+   double tol = FibToleranceUSD; // กำหนดเป็น USD
+   for(int i = 0; i < 5; i++)
+      if(MathAbs(price - fibLevels[i]) <= tol)
+         return true;
+   return false;
+}
+
+bool CheckOrderBlock(bool forBuy)
+{
+   int bars = MathMin(OBLookbackBars, Bars(Symbol(), PERIOD_CURRENT)-2);
+
+   for(int i=2; i<=bars; i++)
+   {
+      double o = iOpen(NULL,0,i);
+      double c = iClose(NULL,0,i);
+      double o1 = iOpen(NULL,0,i-1);
+      double c1 = iClose(NULL,0,i-1);
+
+      double body = MathAbs(c1 - o1);
+      double prevBody = MathAbs(c - o);
+
+      if(forBuy)
+      {
+         if(c1 > o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+      else
+      {
+         if(c1 < o1 && body >= OBImpulseMult * prevBody)
+            return true;
+      }
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| END: User's Original Functions                                   |
+//+------------------------------------------------------------------+
+
+
+//+------------------------------------------------------------------+
+//| STRATEGY 1: Run Trend Following (User's Original Logic)          |
+//+------------------------------------------------------------------+
+void RunTrendingStrategy()
+{
+   // 1. Get MA data
+   double fastMA[2], slowMA[2];
+   if(CopyBuffer(fastHandle,0,0,2,fastMA) < 2 || CopyBuffer(slowHandle,0,0,2,slowMA) < 2)
+      return;
+
+   // 2. Fib Filter
+   double price = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   if(UseFibonacci)
+      CalculateFibLevels();
+
+   bool nearFib = UseFibonacci ? PriceNearFib(price) : true;
+
+   if(!nearFib)
+   {
+      // Print("TREND: No trade, price not near Fib zone.");
+      return;
+   }
+   
+   // 3. Position Check
+   bool positionOpen = PositionSelect(Symbol());
+   long positionType = -1;
+   if(positionOpen)
+      positionType = PositionGetInteger(POSITION_TYPE);
+
+   // 4. Trade Logic (User's Original Crossover Logic)
+   
+   // --- Bullish crossover (User's original) + Order Block ---
+   if(fastMA[1] > slowMA[1] && fastMA[0] < slowMA[0] && CheckOrderBlock(true))
+   {
+      Print("TREND: BUY triggered (User's logic)");
+      if(!positionOpen)
+         trade.Buy(LotSize, Symbol());
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         trade.PositionClose(Symbol());
+         trade.Buy(LotSize, Symbol());
+      }
+   }
+
+   // --- Bearish crossover (User's original) + Order Block ---
+   if(fastMA[1] < slowMA[1] && fastMA[0] > slowMA[0] && CheckOrderBlock(false))
+   {
+      Print("TREND: SELL triggered (User's logic)");
+      if(!positionOpen)
+         trade.Sell(LotSize, Symbol());
+      else if(positionType == POSITION_TYPE_BUY)
+      {
+         trade.PositionClose(Symbol());
+         trade.Sell(LotSize, Symbol());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| STRATEGY 2: Run Sideways (New RSI Mean Reversion)                |
+//+------------------------------------------------------------------+
+void RunSidewaysStrategy()
+{
+   // 1. Get RSI data
+   double rsi[2];
+   if(CopyBuffer(rsiHandle, 0, 0, 2, rsi) < 2)
+   {
+      Print("SIDEWAYS: Error copying RSI buffer");
+      return;
+   }
+   
+   // 2. Get Prices and SL/TP levels
+   double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   double slBuy = ask - Sideways_SL_Points * _Point;
+   double tpBuy = ask + Sideways_TP_Points * _Point;
+   double slSell = bid + Sideways_SL_Points * _Point;
+   double tpSell = bid - Sideways_TP_Points * _Point;
+
+   // 3. Position Check
+   bool positionOpen = PositionSelect(Symbol());
+   long positionType = -1;
+   if(positionOpen)
+      positionType = PositionGetInteger(POSITION_TYPE);
+      
+   // 4. Trade Logic (RSI)
+
+   // --- BUY Signal: RSI crosses UP from Oversold ---
+   if(rsi[1] < RSI_Oversold && rsi[0] > RSI_Oversold)
+   {
+      Print("SIDEWAYS: RSI BUY Triggered");
+      if(!positionOpen)
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, "Sideways RSI Buy");
+      else if(positionType == POSITION_TYPE_SELL)
+      {
+         trade.PositionClose(Symbol());
+         trade.Buy(LotSize, Symbol(), ask, slBuy, tpBuy, "Sideways RSI Buy");
+      }
+   }
+   
+   // --- SELL Signal: RSI crosses DOWN from Overbought ---
+   if(rsi[1] > RSI_Overbought && rsi[0] < RSI_Overbought)
+   {
+      Print("SIDEWAYS: RSI SELL Triggered");
+      if(!positionOpen)
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, "Sideways RSI Sell");
+      else if(positionType == POSITION_TYPE_BUY)
+      {
+         trade.PositionClose(Symbol());
+         trade.Sell(LotSize, Symbol(), bid, slSell, tpSell, "Sideways RSI Sell");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Initialization                                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Handles for Trend Strategy
+   fastHandle = iMA(NULL, PERIOD_CURRENT, FastMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   slowHandle = iMA(NULL, PERIOD_CURRENT, SlowMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
+   
+   // Handles for Detector & Sideways Strategy
+   adxHandle = iADX(NULL, PERIOD_CURRENT, ADX_Period);
+   rsiHandle = iRSI(NULL, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
+
+   if(fastHandle == INVALID_HANDLE || slowHandle == INVALID_HANDLE || adxHandle == INVALID_HANDLE || rsiHandle == INVALID_HANDLE)
+   {
+      Print("Error creating indicator handles");
+      return(INIT_FAILED);
+   }
+
+   CalculateFibLevels(); // คำนวณครั้งแรกตอนเริ่ม
+   Print("EA Dual-Mode Initialized: (Trend: User's MA Crossover) | (Sideways: RSI Reversion)");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Deinitialization                                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   IndicatorRelease(fastHandle);
+   IndicatorRelease(slowHandle);
+   IndicatorRelease(adxHandle);
+   IndicatorRelease(rsiHandle);
+   Print("EA Deinitialized. Handles released.");
+}
+
+//+------------------------------------------------------------------+
+//| Main Controller Logic                                            |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime barTime = iTime(NULL, 0, 0);
+   if(barTime == lastBarTime) return;
+   lastBarTime = barTime;
+
+   // --- 1. Market Detector (ADX) ---
+   double adxValue[1];
+   if(CopyBuffer(adxHandle, 0, 1, 1, adxValue) < 1) // เอาค่า ADX (Main line) จากแท่งที่แล้ว (shift=1)
+   {
+      Print("Error copying ADX buffer");
+      return;
+   }
+
+   // --- 2. The Switch ---
+   if(adxValue[0] >= ADX_Threshold)
+   {
+      // --- MARKET IS TRENDING ---
+      // PrintFormat("Market: TRENDING (ADX=%.2f)", adxValue[0]);
+      RunTrendingStrategy();
+   }
+   else
+   {
+      // --- MARKET IS SIDEWAYS ---
+      // PrintFormat("Market: SIDEWAYS (ADX=%.2f)", adxValue[0]);
+      RunSidewaysStrategy();
+   }
+}
